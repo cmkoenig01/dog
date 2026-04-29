@@ -97,7 +97,9 @@ def get_walk_state(d, nav_cmd):
     ])
 
 def _is_fallen(d):
-    return d.qpos[3] < 0.65 or d.xpos[1][2] < 0.15
+    qx, qy = d.qpos[4], d.qpos[5]
+    upright_z = 1.0 - 2.0 * (qx**2 + qy**2)  # body z-axis dot world z, ignores yaw
+    return upright_z < 0.5 or d.xpos[1][2] < 0.15
 
 def reset(goal_pos):
     mujoco.mj_resetDataKeyframe(m, d, 0)

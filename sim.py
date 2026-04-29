@@ -110,7 +110,9 @@ def get_walk_state(d, nav_cmd):
     ])  # total: 34
 
 def _is_fallen(d):
-    return d.qpos[3] < 0.65 or d.xpos[1][2] < 0.15
+    qx, qy = d.qpos[4], d.qpos[5]
+    upright_z = 1.0 - 2.0 * (qx**2 + qy**2)
+    return upright_z < 0.5 or d.xpos[1][2] < 0.15
 
 def compute_nav_reward(d, goal_pos, at_goal):
     robot_xy     = d.xpos[1][:2]
@@ -135,24 +137,39 @@ def compute_nav_reward(d, goal_pos, at_goal):
         still_reward = 4.0 * max(0.0, 1.0 - body_speed / 0.3)
         return still_reward + 50.0
 
-    TARGET_SPEED = 0.5
+    TARGET_SPEED  = 0.5
+    ALIGN_THRESH  = 0.7  # heading_align threshold (~45 degrees)
 
-    heading_reward   = 2.0 * max(0.0, heading_align)
-    facing_reward    = 3.0 * max(0.0, heading_align) ** 2
-    correct_turn     = float(np.sign(angle_err) * yaw_signed > 0)
-    turn_reward      = 2.0 * yaw_rate * correct_turn * max(0.0, 1.0 - heading_align)
-    align_factor     = 0.5 + 0.5 * max(0.0, heading_align)
-    goal_vel_reward  = 4.0 * min(max(0.0, goal_vel), TARGET_SPEED) * align_factor
-    goal_bonus       = 50.0 * float(dist_to_goal < GOAL_RADIUS)
+    facing_reward = 3.0 * max(0.0, heading_align) ** 2
+    err_norm      = float(np.clip(angle_err / np.pi, -1.0, 1.0))
+    desired_yaw   = err_norm * 1.0
+    dist_factor   = min(1.0, dist_to_goal / 0.6)
+    goal_bonus    = 50.0 * float(dist_to_goal < GOAL_RADIUS)
 
-    away_pen         = (4.0 + 8.0 * max(0.0, heading_align)) * max(0.0, -goal_vel)
-    stationary_pen   = 2.0 * float(body_speed < 0.05) * max(0.0, heading_align)
-    lateral_pen      = 10.0 * lateral_vel ** 2
-    yaw_pen          = max(0.0, heading_align) * (1.5 * yaw_rate + 2.0 * max(0.0, yaw_rate - 1.5))
+    if heading_align >= ALIGN_THRESH:
+        # ALIGNED: reward forward speed, gentle correction only
+        goal_vel_reward = 5.0 * min(max(0.0, goal_vel), TARGET_SPEED) * dist_factor
+        turn_reward     = 2.0 * desired_yaw * float(np.tanh(yaw_signed))
+        fast_fwd_pen    = 0.0
+    else:
+        # MISALIGNED: reward turning hard, allow only crawl speed forward
+        goal_vel_reward = 1.0 * min(max(0.0, goal_vel), 0.15)
+        turn_reward     = 7.0 * desired_yaw * float(np.tanh(yaw_signed))
+        fast_fwd_pen    = 6.0 * max(0.0, goal_vel - 0.15)
+
+    # Hysteresis proxy: being close but misaligned = massive penalty
+    misalign_mag          = min(1.0, max(0.0, ALIGN_THRESH - heading_align))
+    proximity_misalign_pen = 12.0 * max(0.0, 1.0 - dist_to_goal / 1.5) * misalign_mag
+
+    away_pen         = (8.0 + 8.0 * max(0.0, heading_align)) * max(0.0, -goal_vel)
+    stationary_pen   = 2.0 * float(body_speed < 0.05) * max(0.0, 1.0 - abs(err_norm))
+    lateral_pen      = 4.0 * lateral_vel ** 2
     speed_excess_pen = 3.0 * max(0.0, goal_vel - TARGET_SPEED)
+    fast_spin_pen    = 2.0 * max(0.0, yaw_rate - 1.2)
 
-    return (heading_reward + facing_reward + turn_reward + goal_vel_reward + goal_bonus
-            - away_pen - stationary_pen - lateral_pen - yaw_pen - speed_excess_pen)
+    return (facing_reward + turn_reward + goal_vel_reward + goal_bonus
+            - away_pen - stationary_pen - lateral_pen - speed_excess_pen
+            - fast_spin_pen - fast_fwd_pen - proximity_misalign_pen)
 
 def compute_walk_reward(d, action, prev_action, at_goal, nav_cmd):
     foot_contacts = get_foot_contacts(d)
@@ -197,36 +214,34 @@ def compute_walk_reward(d, action, prev_action, at_goal, nav_cmd):
     trot_reward           = 3.0 * float(trot_active)
     even_gait_reward      = 1.0 * float(trot_active and n_contacts == 2)
     swing_momentum_reward = 0.15 * min(float(np.sum(np.abs(d.qvel[6:18]))), 20.0) * float(trot_active)
-    diagonal_sync_pen     = 2.5 * diag_diff * float(trot_active)
+    diagonal_sync_pen     = 2.5 * diag_diff
     upright           = 0.3 * d.qpos[3]
     flatness_reward   = 0.5 * max(0.0, 1.0 - 20.0 * tilt)
     # Reward executing the nav forward command
     cmd_vel_reward    = 4.0 * min(max(0.0, body_fwd_vel), TARGET_SPEED) * max(0.0, fwd_cmd)
     # Reward executing the nav turn command — positive turn_cmd = turn right (positive yaw)
-    turn_follow_reward = 3.0 * actual_yaw_rate * turn_cmd
+    turn_follow_reward = 3.0 * float(np.clip(actual_yaw_rate * turn_cmd, -2.0, 2.0))
 
-    backward_pen      = 25.0 * max(0.0, -body_fwd_vel)
+    fwd_bias          = 1.5 * min(max(0.0, body_fwd_vel), TARGET_SPEED) * max(0.0, fwd_cmd)
+    backward_pen      = 15.0 * max(0.0, -body_fwd_vel)
     lateral_scale     = max(0.7, 1.0 - 0.3 * abs(turn_cmd))
     lateral_pen       = (15.0 * abs(body_lat_vel) + 30.0 * body_lat_vel ** 2) * lateral_scale
     hop_pen           = 2.0 * float(hop_active)
     grounded_pen      = 2.0 * float(n_contacts == 4)
     height_pen        = 3.0 * max(0.0, 0.28 - d.xpos[1][2])
-    tilt_pen          = 10.0 * tilt
-    roll_pen          = 3.0 * abs(d.qpos[4])
-    pitch_pen         = 3.0 * abs(d.qpos[5])
+    tilt_pen          = 15.0 * tilt
     roll_rate_pen     = 3.0 * abs(d.qvel[3])
     torque_pen        = 0.001 * np.sum(action ** 2)
     smoothness        = 0.01  * np.sum((action - prev_action) ** 2)
     joint_vel_pen     = 0.001 * np.sum(d.qvel[6:18] ** 2)
-    hip_pen           = 0.02  * np.sum(d.qpos[joint_inds[[0, 3, 6, 9]]] ** 2)
+    hip_pen           = 0.15  * np.sum(d.qpos[joint_inds[[0, 3, 6, 9]]] ** 2)
     stationary_pen    = 3.0 * float(body_speed < 0.05) * max(0.0, fwd_cmd)
-    # Penalise unintended rotation when nav isn't commanding a turn
     unwanted_turn_pen = 1.5 * actual_yaw_rate ** 2 * max(0.0, 1.0 - abs(turn_cmd))
 
     return (trot_reward + clearance_reward + even_gait_reward + swing_momentum_reward
-            + upright + flatness_reward + cmd_vel_reward + turn_follow_reward
+            + upright + flatness_reward + cmd_vel_reward + turn_follow_reward + fwd_bias
             - backward_pen - lateral_pen - hop_pen - grounded_pen - height_pen
-            - tilt_pen - roll_pen - pitch_pen - roll_rate_pen
+            - tilt_pen - roll_rate_pen
             - torque_pen - smoothness - joint_vel_pen - hip_pen - stationary_pen
             - unwanted_turn_pen - diagonal_sync_pen)
 
