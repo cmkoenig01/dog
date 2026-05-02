@@ -98,7 +98,7 @@ def get_nav_state(d, goal_pos):
         [np.sin(robot_yaw)],   # robot yaw sin     — 1
     ])  # total: 15
 
-# Walk state: 34D — body state + nav command from nav policy
+# Walk state: 34D — body state + nav command from navigation policy
 def get_walk_state(d, nav_cmd):
     return np.concatenate([
         d.qpos[3:7],           # orientation  — 4
